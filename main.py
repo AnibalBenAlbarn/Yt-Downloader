@@ -47,6 +47,7 @@ VIDEO_FORMAT_SPECS: Dict[str, Dict[str, str]] = {
     "avi (MPEG4 + MP3)": {"ext": "avi", "vcodec": "mpeg4", "acodec": "libmp3lame", "pix_fmt": "yuv420p"},
 }
 MAX_AUTO_RETRIES = 2
+SEARCH_RESULTS_LIMIT = 5
 NON_RETRYABLE_ERROR_PATTERNS = (
     "Sign in to confirm your age",
     "Use --cookies-from-browser",
@@ -148,8 +149,11 @@ class MetadataWorker(QThread):
         self.query = query
     def run(self):
         try:
-            target = self.url if not self.query else f"ytsearch10:{self.url}"
-            cmd = [YTDLP_EXE, "--no-config", "--skip-download", "-J", target]
+            target = self.url if not self.query else f"ytsearch{SEARCH_RESULTS_LIMIT}:{self.url}"
+            cmd = [YTDLP_EXE, "--no-config", "--skip-download", "-J"]
+            if self.query:
+                cmd.extend(["--flat-playlist", "--playlist-end", str(SEARCH_RESULTS_LIMIT)])
+            cmd.append(target)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if p.returncode != 0:
                 raise RuntimeError(p.stderr.strip() or "Error consultando metadatos")
@@ -371,7 +375,7 @@ class MainWindow(QMainWindow):
     def _build_search_tab(self):
         layout = QVBoxLayout(self.tab_search)
         row = QHBoxLayout()
-        self.search_text = QLineEdit(); self.search_text.setPlaceholderText("Busca vídeos (ytsearch)")
+        self.search_text = QLineEdit(); self.search_text.setPlaceholderText(f"Busca vídeos (hasta {SEARCH_RESULTS_LIMIT} resultados)")
         btn = QPushButton("Buscar")
         btn.clicked.connect(self.search_videos)
         row.addWidget(self.search_text); row.addWidget(btn)
@@ -605,13 +609,14 @@ class MainWindow(QMainWindow):
         w.error.connect(lambda e: QMessageBox.warning(self, "Error búsqueda", e))
         w.start()
         self.metadata_workers.append(w)
-        self.log_ui(f"Buscando: {q}")
+        self.log_ui(f"Buscando: {q} (máx. {SEARCH_RESULTS_LIMIT} resultados)")
     def on_search_done(self, data: Dict[str, Any]):
-        entries = data.get("entries") or []
+        entries = (data.get("entries") or [])[:SEARCH_RESULTS_LIMIT]
+        self.search_table.setUpdatesEnabled(False)
+        self.search_table.setSortingEnabled(False)
         self.search_table.setRowCount(0)
-        for e in entries:
-            row = self.search_table.rowCount()
-            self.search_table.insertRow(row)
+        self.search_table.setRowCount(len(entries))
+        for row, e in enumerate(entries):
             checkbox = QCheckBox()
             checkbox.setStyleSheet("margin-left:8px; margin-right:8px;")
             self.search_table.setCellWidget(row, 0, checkbox)
@@ -632,6 +637,7 @@ class MainWindow(QMainWindow):
             action_layout.addWidget(btn_add)
             action_layout.addWidget(btn_now)
             self.search_table.setCellWidget(row, 5, action_widget)
+        self.search_table.setUpdatesEnabled(True)
     def add_search_row_to_basket(self, row: int, refresh: bool = True):
         self._collect_table_edits()
         if row < 0 or row >= self.search_table.rowCount():
