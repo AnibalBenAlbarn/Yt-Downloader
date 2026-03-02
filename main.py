@@ -46,6 +46,13 @@ VIDEO_FORMAT_SPECS: Dict[str, Dict[str, str]] = {
     "webm (VP9 + Opus)": {"ext": "webm", "vcodec": "libvpx-vp9", "acodec": "libopus", "pix_fmt": "yuv420p"},
     "avi (MPEG4 + MP3)": {"ext": "avi", "vcodec": "mpeg4", "acodec": "libmp3lame", "pix_fmt": "yuv420p"},
 }
+MAX_AUTO_RETRIES = 2
+NON_RETRYABLE_ERROR_PATTERNS = (
+    "Sign in to confirm your age",
+    "Use --cookies-from-browser",
+    "No supported JavaScript runtime could be found",
+    "challenge solving failed",
+)
 def now_stamp() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 def safe_filename(text: str) -> str:
@@ -131,6 +138,7 @@ class DownloadItem:
     status: str = "Pendiente"
     progress: int = 0
     file_path: str = ""
+    retry_count: int = 0
 class MetadataWorker(QThread):
     done = pyqtSignal(dict)
     error = pyqtSignal(str)
@@ -230,6 +238,7 @@ class DownloadWorker(QThread):
             if downloaded_path:
                 self.item.file_path = str(downloaded_path)
             self.progress.emit(self.item.url, 100)
+            self.item.retry_count = 0
             self.status.emit(self.item.url, "OK")
             self.finished_item.emit(self.item.url)
         except Exception as e:
@@ -704,6 +713,7 @@ class MainWindow(QMainWindow):
             if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_item:
                 item = dlg.result_item
                 item.status = "En cola"
+                item.retry_count = 0
                 self.downloads.append(item)
                 self.refresh_all_tables()
                 self.save_config()
@@ -718,6 +728,7 @@ class MainWindow(QMainWindow):
         for it in self.basket:
             it.status = "En cola"
             it.progress = 0
+            it.retry_count = 0
             self.downloads.append(it)
         self.basket = []
         self.refresh_all_tables()
@@ -730,9 +741,15 @@ class MainWindow(QMainWindow):
             self.basket.pop(r)
         self.refresh_all_tables()
         self.save_config()
+    def _is_retryable_error(self, err: str) -> bool:
+        return not any(token in err for token in NON_RETRYABLE_ERROR_PATTERNS)
+
+    def _find_download(self, url: str) -> Optional[DownloadItem]:
+        return next((d for d in self.downloads if d.url == url), None)
+
     def start_downloads(self):
         self._collect_table_edits()
-        pending = [d for d in self.downloads if d.status in ("En cola", "Pendiente", "Error")]
+        pending = [d for d in self.downloads if d.status in ("En cola", "Pendiente")]
         if not pending:
             self.log_ui("No hay descargas pendientes")
             return
@@ -741,7 +758,7 @@ class MainWindow(QMainWindow):
     def _schedule_downloads(self):
         cap = self.cfg.simultaneous_downloads
         while len(self.active_workers) < cap:
-            nxt = next((x for x in self.downloads if x.status in ("En cola", "Pendiente", "Error")), None)
+            nxt = next((x for x in self.downloads if x.status in ("En cola", "Pendiente")), None)
             if not nxt:
                 break
             nxt.status = "Iniciando"
@@ -773,7 +790,23 @@ class MainWindow(QMainWindow):
         self._schedule_downloads()
     def on_item_error(self, url: str, err: str):
         self.active_workers.pop(url, None)
-        self.log_ui(f"Error en {url}: {err}")
+        item = self._find_download(url)
+        if item is not None:
+            if self._is_retryable_error(err) and item.retry_count < MAX_AUTO_RETRIES:
+                item.retry_count += 1
+                item.status = "En cola"
+                self.log_ui(f"Error temporal en {url}. Reintento {item.retry_count}/{MAX_AUTO_RETRIES}...")
+            else:
+                if not self._is_retryable_error(err):
+                    item.status = "Error (requiere cookies/sesión)"
+                    self.log_ui(
+                        f"Error no recuperable en {url}. Configura cookies de navegador o login de YouTube para este vídeo."
+                    )
+                else:
+                    item.status = "Error"
+                    self.log_ui(f"Error en {url}: {err}")
+        else:
+            self.log_ui(f"Error en {url}: {err}")
         self._refresh_total_progress()
         self.save_config()
         self._schedule_downloads()
