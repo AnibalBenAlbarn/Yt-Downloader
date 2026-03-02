@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QProgressBar,
@@ -120,6 +122,7 @@ class AppConfig:
 class DownloadItem:
     url: str
     title: str = ""
+    duration: str = ""
     mode: str = "video"  # video/audio
     quality: str = "720p"
     video_format: str = "mp4 (H.264 + AAC)"
@@ -127,6 +130,7 @@ class DownloadItem:
     format_selector: str = "bestvideo+bestaudio/best"
     status: str = "Pendiente"
     progress: int = 0
+    file_path: str = ""
 class MetadataWorker(QThread):
     done = pyqtSignal(dict)
     error = pyqtSignal(str)
@@ -223,6 +227,8 @@ class DownloadWorker(QThread):
                 if self.cfg.hyperspin_enabled:
                     self.status.emit(self.item.url, "Aplicando compatibilidad HyperSpin")
                     downloaded_path = run_hyperspin_compat(downloaded_path, log)
+            if downloaded_path:
+                self.item.file_path = str(downloaded_path)
             self.progress.emit(self.item.url, 100)
             self.status.emit(self.item.url, "OK")
             self.finished_item.emit(self.item.url)
@@ -334,8 +340,10 @@ class MainWindow(QMainWindow):
     def _build_downloads_tab(self):
         layout = QVBoxLayout(self.tab_downloads)
         self.downloads_table = QTableWidget(0, 8)
-        self.downloads_table.setHorizontalHeaderLabels(["URL", "Título", "Modo", "Calidad", "Formato", "Salida", "Estado", "%"])
+        self.downloads_table.setHorizontalHeaderLabels(["URL", "Título", "Duración", "Modo", "Calidad", "Formato", "Salida", "Estado", "%"])
+        self.downloads_table.setColumnCount(9)
         self.downloads_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._configure_table_interactions(self.downloads_table)
         self.current_file_progress = QProgressBar(); self.current_file_progress.setFormat("Archivo actual: %p%")
         self.total_progress = QProgressBar(); self.total_progress.setFormat("Total cola: %p%")
         row = QHBoxLayout()
@@ -379,9 +387,11 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(self.add_url_to_basket)
         btn_quick.clicked.connect(self.quick_download)
         row.addWidget(self.manager_url); row.addWidget(btn_add); row.addWidget(btn_quick)
-        self.basket_table = QTableWidget(0, 7)
-        self.basket_table.setHorizontalHeaderLabels(["URL", "Título", "Modo", "Calidad", "Formato", "Salida", "Estado"])
+        self.basket_table = QTableWidget(0, 9)
+        self.basket_table.setHorizontalHeaderLabels(["URL", "Título", "Duración", "Modo", "Calidad", "Formato", "Salida", "Estado", "Acciones"])
         self.basket_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.basket_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        self._configure_table_interactions(self.basket_table)
         actions = QHBoxLayout()
         btn_send = QPushButton("Añadir a descargas")
         btn_remove = QPushButton("Eliminar de cesta")
@@ -432,6 +442,73 @@ class MainWindow(QMainWindow):
         self._fill_table(self.basket_table, self.basket, include_progress=False)
         self._fill_table(self.downloads_table, self.downloads, include_progress=True)
         self._refresh_total_progress()
+
+    def _configure_table_interactions(self, table: QTableWidget):
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(lambda pos, t=table: self.show_table_context_menu(t, pos))
+
+    def _open_item_folder(self, item: DownloadItem):
+        target = Path(item.file_path) if item.file_path else Path(self.cfg.video_dir if item.mode == "video" else self.cfg.audio_dir)
+        folder = target.parent if target.is_file() else target
+        if not folder.exists():
+            QMessageBox.warning(self, "Carpeta", "La carpeta no existe todavía")
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(str(folder))
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(folder)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(folder)], check=False)
+
+    def _cancel_item_download(self, item: DownloadItem):
+        worker = self.active_workers.get(item.url)
+        if worker:
+            worker.cancel()
+            item.status = "Cancelado"
+
+    def _delete_item_with_prompt(self, source: List[DownloadItem], row: int):
+        item = source[row]
+        ask = QMessageBox(self)
+        ask.setWindowTitle("Eliminar registro")
+        ask.setText("¿Qué quieres eliminar?")
+        btn_record = ask.addButton("Solo registro", QMessageBox.ButtonRole.AcceptRole)
+        btn_both = ask.addButton("Registro + archivo", QMessageBox.ButtonRole.DestructiveRole)
+        ask.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        ask.exec()
+        clicked = ask.clickedButton()
+        if clicked is None or clicked.text() == "Cancelar":
+            return
+        if clicked == btn_both and item.file_path:
+            try:
+                p = Path(item.file_path)
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception as e:
+                QMessageBox.warning(self, "Eliminar archivo", f"No se pudo eliminar: {e}")
+        source.pop(row)
+
+    def show_table_context_menu(self, table: QTableWidget, pos):
+        rows = sorted({i.row() for i in table.selectionModel().selectedRows()}, reverse=True)
+        if not rows:
+            return
+        source = self.downloads if table is self.downloads_table else self.basket
+        menu = QMenu(self)
+        act_open = menu.addAction("Abrir carpeta")
+        act_cancel = menu.addAction("Cancelar descarga")
+        act_delete = menu.addAction("Eliminar registro")
+        chosen = menu.exec(table.viewport().mapToGlobal(pos))
+        if chosen == act_open:
+            self._open_item_folder(source[rows[-1]])
+        elif chosen == act_cancel:
+            for r in rows:
+                self._cancel_item_download(source[r])
+        elif chosen == act_delete:
+            for r in rows:
+                self._delete_item_with_prompt(source, r)
+        self.refresh_all_tables()
+        self.save_config()
     def _fill_table(self, table: QTableWidget, items: List[DownloadItem], include_progress: bool):
         table.setRowCount(0)
         for it in items:
@@ -439,6 +516,7 @@ class MainWindow(QMainWindow):
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(it.url))
             table.setItem(row, 1, QTableWidgetItem(it.title))
+            table.setItem(row, 2, QTableWidgetItem(it.duration))
             mode = QComboBox(); mode.addItems(["video", "audio"]); mode.setCurrentText(it.mode)
             quality = QComboBox(); quality.addItems(["1080p", "720p", "480p", "360p", "240p"]); quality.setCurrentText(it.quality)
             fmt = QComboBox(); fmt.addItems(parse_allowed_video_formats(self.cfg.allowed_video_formats)); fmt.setCurrentText(it.video_format)
@@ -446,23 +524,48 @@ class MainWindow(QMainWindow):
                 fmt.setCurrentIndex(0)
             fmt.setEnabled(it.mode == "video")
             mode.currentTextChanged.connect(lambda text, f=fmt: f.setEnabled(text == "video"))
-            table.setCellWidget(row, 2, mode)
-            table.setCellWidget(row, 3, quality)
-            table.setCellWidget(row, 4, fmt)
-            table.setItem(row, 5, QTableWidgetItem(it.output_name))
-            table.setItem(row, 6, QTableWidgetItem(it.status))
+            table.setCellWidget(row, 3, mode)
+            table.setCellWidget(row, 4, quality)
+            table.setCellWidget(row, 5, fmt)
+            table.setItem(row, 6, QTableWidgetItem(it.output_name))
+            table.setItem(row, 7, QTableWidgetItem(it.status))
+            if not include_progress:
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(0, 0, 0, 0)
+                action_layout.setSpacing(4)
+                btn_open = QPushButton("📁")
+                btn_cancel = QPushButton("⏹")
+                btn_delete = QPushButton("🗑")
+                btn_open.setToolTip("Abrir carpeta")
+                btn_cancel.setToolTip("Cancelar descarga")
+                btn_delete.setToolTip("Eliminar registro")
+                btn_open.clicked.connect(lambda _, item=it: self._open_item_folder(item))
+                btn_cancel.clicked.connect(lambda _, item=it: self._cancel_item_download(item))
+                btn_delete.clicked.connect(lambda _, r=row, s=items: self._delete_row_action(s, r))
+                action_layout.addWidget(btn_open)
+                action_layout.addWidget(btn_cancel)
+                action_layout.addWidget(btn_delete)
+                table.setCellWidget(row, 8, action_widget)
             if include_progress:
-                table.setItem(row, 7, QTableWidgetItem(str(it.progress)))
+                table.setItem(row, 8, QTableWidgetItem(str(it.progress)))
+
+    def _delete_row_action(self, source: List[DownloadItem], row: int):
+        self._collect_table_edits()
+        if 0 <= row < len(source):
+            self._delete_item_with_prompt(source, row)
+            self.refresh_all_tables()
+            self.save_config()
     def _collect_table_edits(self):
         def update_from_table(table: QTableWidget, target: List[DownloadItem], has_progress: bool):
             for i, item in enumerate(target):
-                item.mode = table.cellWidget(i, 2).currentText()  # type: ignore
-                item.quality = table.cellWidget(i, 3).currentText()  # type: ignore
-                item.video_format = table.cellWidget(i, 4).currentText()  # type: ignore
-                item.output_name = (table.item(i, 5).text() if table.item(i, 5) else item.output_name).strip()
-                if has_progress and table.item(i, 7):
+                item.mode = table.cellWidget(i, 3).currentText()  # type: ignore
+                item.quality = table.cellWidget(i, 4).currentText()  # type: ignore
+                item.video_format = table.cellWidget(i, 5).currentText()  # type: ignore
+                item.output_name = (table.item(i, 6).text() if table.item(i, 6) else item.output_name).strip()
+                if has_progress and table.item(i, 8):
                     try:
-                        item.progress = int(table.item(i, 7).text())
+                        item.progress = int(table.item(i, 8).text())
                     except Exception:
                         pass
         update_from_table(self.basket_table, self.basket, False)
@@ -504,6 +607,7 @@ class MainWindow(QMainWindow):
             action_layout.addWidget(btn_now)
             self.search_table.setCellWidget(row, 5, action_widget)
     def add_search_row_to_basket(self, row: int, refresh: bool = True):
+        self._collect_table_edits()
         if row < 0 or row >= self.search_table.rowCount():
             return
         url_item = self.search_table.item(row, 4)
@@ -514,7 +618,9 @@ class MainWindow(QMainWindow):
         title = title_item.text().strip()
         if not url:
             return
-        self.basket.append(DownloadItem(url=url, title=title, quality=self.cfg.default_video_quality, video_format=self.cfg.default_video_format, output_name=safe_filename(title)))
+        duration_item = self.search_table.item(row, 3)
+        duration = duration_item.text().strip() if duration_item else ""
+        self.basket.append(DownloadItem(url=url, title=title, duration=duration, quality=self.cfg.default_video_quality, video_format=self.cfg.default_video_format, output_name=safe_filename(title)))
         if refresh:
             self.refresh_all_tables()
             self.save_config()
@@ -555,15 +661,38 @@ class MainWindow(QMainWindow):
         self.save_config()
         self.tabs.setCurrentWidget(self.tab_downloads)
     def add_url_to_basket(self):
+        self._collect_table_edits()
         urls = split_urls(self.manager_url.text().strip())
         if not urls:
             QMessageBox.information(self, "URL", "Introduce una URL válida")
             return
         for url in urls:
-            self.basket.append(DownloadItem(url=url, title=url, quality=self.cfg.default_video_quality, video_format=self.cfg.default_video_format, output_name=""))
+            item = DownloadItem(url=url, title="Consultando título...", status="Consultando metadatos", quality=self.cfg.default_video_quality, video_format=self.cfg.default_video_format, output_name="")
+            self.basket.append(item)
+            self._fetch_metadata_for_item(item)
         self.manager_url.clear()
         self.refresh_all_tables()
         self.save_config()
+
+    def _fetch_metadata_for_item(self, item: DownloadItem):
+        w = MetadataWorker(item.url)
+        def done(data: Dict[str, Any], target=item):
+            target.title = data.get("title", target.url)
+            target.duration = str(data.get("duration_string", "") or "")
+            if not target.output_name:
+                target.output_name = safe_filename(target.title)
+            target.status = "Pendiente"
+            self.refresh_all_tables()
+            self.save_config()
+        def failed(err: str, target=item):
+            target.title = target.url
+            target.status = f"Metadata error: {err}"
+            self.refresh_all_tables()
+            self.save_config()
+        w.done.connect(done)
+        w.error.connect(failed)
+        w.start()
+        self.metadata_workers.append(w)
     def quick_download(self):
         url = self.manager_url.text().strip()
         if not url:
@@ -595,6 +724,7 @@ class MainWindow(QMainWindow):
         self.save_config()
         self.tabs.setCurrentWidget(self.tab_downloads)
     def remove_basket_selected(self):
+        self._collect_table_edits()
         rows = sorted({i.row() for i in self.basket_table.selectionModel().selectedRows()}, reverse=True)
         for r in rows:
             self.basket.pop(r)
