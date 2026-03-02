@@ -348,10 +348,10 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
     def _build_downloads_tab(self):
         layout = QVBoxLayout(self.tab_downloads)
-        self.downloads_table = QTableWidget(0, 8)
-        self.downloads_table.setHorizontalHeaderLabels(["URL", "Título", "Duración", "Modo", "Calidad", "Formato", "Salida", "Estado", "%"])
-        self.downloads_table.setColumnCount(9)
+        self.downloads_table = QTableWidget(0, 10)
+        self.downloads_table.setHorizontalHeaderLabels(["URL", "Título", "Duración", "Modo", "Calidad", "Formato", "Salida", "Estado", "%", "Acciones"])
         self.downloads_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.downloads_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
         self._configure_table_interactions(self.downloads_table)
         self.current_file_progress = QProgressBar(); self.current_file_progress.setFormat("Archivo actual: %p%")
         self.total_progress = QProgressBar(); self.total_progress.setFormat("Total cola: %p%")
@@ -477,8 +477,7 @@ class MainWindow(QMainWindow):
             worker.cancel()
             item.status = "Cancelado"
 
-    def _delete_item_with_prompt(self, source: List[DownloadItem], row: int):
-        item = source[row]
+    def _ask_delete_mode(self) -> Optional[str]:
         ask = QMessageBox(self)
         ask.setWindowTitle("Eliminar registro")
         ask.setText("¿Qué quieres eliminar?")
@@ -488,8 +487,16 @@ class MainWindow(QMainWindow):
         ask.exec()
         clicked = ask.clickedButton()
         if clicked is None or clicked.text() == "Cancelar":
-            return
-        if clicked == btn_both and item.file_path:
+            return None
+        if clicked == btn_both:
+            return "record_and_file"
+        if clicked == btn_record:
+            return "record"
+        return None
+
+    def _delete_item_with_mode(self, source: List[DownloadItem], row: int, delete_file: bool):
+        item = source[row]
+        if delete_file and item.file_path:
             try:
                 p = Path(item.file_path)
                 if p.exists() and p.is_file():
@@ -497,6 +504,12 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Eliminar archivo", f"No se pudo eliminar: {e}")
         source.pop(row)
+
+    def _delete_item_with_prompt(self, source: List[DownloadItem], row: int):
+        delete_mode = self._ask_delete_mode()
+        if delete_mode is None:
+            return
+        self._delete_item_with_mode(source, row, delete_file=delete_mode == "record_and_file")
 
     def show_table_context_menu(self, table: QTableWidget, pos):
         rows = sorted({i.row() for i in table.selectionModel().selectedRows()}, reverse=True)
@@ -514,8 +527,11 @@ class MainWindow(QMainWindow):
             for r in rows:
                 self._cancel_item_download(source[r])
         elif chosen == act_delete:
+            delete_mode = self._ask_delete_mode()
+            if delete_mode is None:
+                return
             for r in rows:
-                self._delete_item_with_prompt(source, r)
+                self._delete_item_with_mode(source, r, delete_file=delete_mode == "record_and_file")
         self.refresh_all_tables()
         self.save_config()
     def _fill_table(self, table: QTableWidget, items: List[DownloadItem], include_progress: bool):
@@ -538,7 +554,9 @@ class MainWindow(QMainWindow):
             table.setCellWidget(row, 5, fmt)
             table.setItem(row, 6, QTableWidgetItem(it.output_name))
             table.setItem(row, 7, QTableWidgetItem(it.status))
-            if not include_progress:
+            if include_progress:
+                table.setItem(row, 8, QTableWidgetItem(str(it.progress)))
+            if (table is self.basket_table) or (table is self.downloads_table):
                 action_widget = QWidget()
                 action_layout = QHBoxLayout(action_widget)
                 action_layout.setContentsMargins(0, 0, 0, 0)
@@ -555,9 +573,8 @@ class MainWindow(QMainWindow):
                 action_layout.addWidget(btn_open)
                 action_layout.addWidget(btn_cancel)
                 action_layout.addWidget(btn_delete)
-                table.setCellWidget(row, 8, action_widget)
-            if include_progress:
-                table.setItem(row, 8, QTableWidgetItem(str(it.progress)))
+                action_column = 9 if include_progress else 8
+                table.setCellWidget(row, action_column, action_widget)
 
     def _delete_row_action(self, source: List[DownloadItem], row: int):
         self._collect_table_edits()
