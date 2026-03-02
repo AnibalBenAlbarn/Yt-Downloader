@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -40,6 +41,7 @@ FFMPEG_EXE = str(Path(__file__).parent / "ffmpeg.exe")
 CONFIG_PATH = Path(__file__).parent / "config.json"
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
 
 def now_stamp() -> str:
@@ -89,6 +91,146 @@ class DownloadItem:
     format_selector: str = "bestvideo+bestaudio/best"
     status: str = "Pendiente"
     progress: int = 0
+
+
+@dataclass
+class HyperSpinJob:
+    input_path: str
+    output_path: str
+    row_index: int
+
+
+class HyperSpinWorker(QThread):
+    log = pyqtSignal(str)
+    file_progress = pyqtSignal(int)
+    file_status = pyqtSignal(int, str)
+    total_progress = pyqtSignal(int)
+    finished_all = pyqtSignal()
+
+    def __init__(self, ffmpeg_exe: str, jobs: List[HyperSpinJob]):
+        super().__init__()
+        self.ffmpeg_exe = ffmpeg_exe
+        self.jobs = jobs
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        total = len(self.jobs)
+        for idx, job in enumerate(self.jobs, start=1):
+            if self._cancel:
+                self.file_status.emit(job.row_index, "Cancelado")
+                break
+            self.file_status.emit(job.row_index, "Convirtiendo")
+            self.file_progress.emit(0)
+            self.log.emit(f"Convirtiendo: {Path(job.input_path).name}")
+            duration = self._probe_duration(job.input_path)
+            args = [
+                self.ffmpeg_exe,
+                "-y",
+                "-i",
+                job.input_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-level",
+                "4.1",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "slow",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                job.output_path,
+            ]
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            try:
+                while True:
+                    if self._cancel:
+                        proc.terminate()
+                        self.file_status.emit(job.row_index, "Cancelado")
+                        break
+                    line = proc.stdout.readline() if proc.stdout else ""
+                    if not line:
+                        break
+                    line = line.strip()
+                    if line.startswith("out_time_ms="):
+                        try:
+                            ms = int(line.split("=", 1)[1])
+                            if duration and duration > 0:
+                                cur = ms / 1_000_000
+                                self.file_progress.emit(max(0, min(100, int(cur / duration * 100))))
+                        except Exception:
+                            pass
+                    if line.startswith("progress=") and line.endswith("end"):
+                        self.file_progress.emit(100)
+                    if line and not line.startswith(("frame=", "fps=", "out_time_ms=", "progress=")):
+                        self.log.emit(line)
+                rc = proc.wait()
+                if not self._cancel and rc == 0:
+                    os.replace(job.output_path, job.input_path)
+                    self.file_status.emit(job.row_index, "OK")
+                    self.file_progress.emit(100)
+                elif not self._cancel:
+                    self.file_status.emit(job.row_index, f"Error ({rc})")
+                    if os.path.exists(job.output_path):
+                        os.remove(job.output_path)
+            except Exception as ex:
+                self.file_status.emit(job.row_index, "Error")
+                self.log.emit(f"Error: {ex}")
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+
+            self.total_progress.emit(int(idx / total * 100))
+            if self._cancel:
+                break
+
+        self.finished_all.emit()
+
+    def _probe_duration(self, video_path: str) -> Optional[float]:
+        ffprobe = shutil.which("ffprobe") or str(Path(self.ffmpeg_exe).with_name("ffprobe.exe"))
+        if not ffprobe or not Path(ffprobe).exists():
+            return None
+        try:
+            p = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if p.returncode != 0:
+                return None
+            return float((p.stdout or "").strip())
+        except Exception:
+            return None
 
 
 class MetadataWorker(QThread):
@@ -263,16 +405,20 @@ class MainWindow(QMainWindow):
         self.tab_downloads = QWidget()
         self.tab_search = QWidget()
         self.tab_manager = QWidget()
+        self.tab_hyperspin = QWidget()
+        self.hyperspin_worker: Optional[HyperSpinWorker] = None
 
         self.tabs.addTab(self.tab_config, "Configuración")
         self.tabs.addTab(self.tab_downloads, "Tabla de descargas")
         self.tabs.addTab(self.tab_search, "Búsqueda")
         self.tabs.addTab(self.tab_manager, "Gestor de descargas")
+        self.tabs.addTab(self.tab_hyperspin, "HyperSpin")
 
         self._build_config_tab()
         self._build_downloads_tab()
         self._build_search_tab()
         self._build_manager_tab()
+        self._build_hyperspin_tab()
 
         self.load_config()
         self.refresh_all_tables()
@@ -384,6 +530,174 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         layout.addWidget(self.basket_table)
         layout.addLayout(actions)
+
+
+    def _build_hyperspin_tab(self):
+        layout = QVBoxLayout(self.tab_hyperspin)
+
+        controls = QHBoxLayout()
+        self.hyperspin_folder = QLineEdit()
+        self.hyperspin_folder.setPlaceholderText("Carpeta con vídeos")
+        btn_folder = QPushButton("Elegir carpeta")
+        btn_scan = QPushButton("Escanear no compatibles")
+        btn_folder.clicked.connect(lambda: self.pick_dir(self.hyperspin_folder))
+        btn_scan.clicked.connect(self.scan_hyperspin_incompatible)
+        controls.addWidget(self.hyperspin_folder)
+        controls.addWidget(btn_folder)
+        controls.addWidget(btn_scan)
+
+        self.hyperspin_table = QTableWidget(0, 5)
+        self.hyperspin_table.setHorizontalHeaderLabels(["✔", "Archivo", "Vídeo", "Audio", "Estado"])
+        self.hyperspin_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.hyperspin_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+
+        row = QHBoxLayout()
+        self.hyperspin_select_all = QCheckBox("Seleccionar todos")
+        self.hyperspin_select_all.stateChanged.connect(self.toggle_hyperspin_checks)
+        btn_convert = QPushButton("Convertir seleccionados")
+        btn_cancel = QPushButton("Cancelar")
+        btn_convert.clicked.connect(self.start_hyperspin_conversion)
+        btn_cancel.clicked.connect(self.cancel_hyperspin_conversion)
+        self.hyperspin_btn_convert = btn_convert
+        self.hyperspin_btn_cancel = btn_cancel
+        self.hyperspin_btn_cancel.setEnabled(False)
+        row.addWidget(self.hyperspin_select_all)
+        row.addStretch(1)
+        row.addWidget(btn_convert)
+        row.addWidget(btn_cancel)
+
+        self.hyperspin_file_progress = QProgressBar()
+        self.hyperspin_total_progress = QProgressBar()
+        self.hyperspin_log = QTextEdit()
+        self.hyperspin_log.setReadOnly(True)
+
+        layout.addLayout(controls)
+        layout.addLayout(row)
+        layout.addWidget(self.hyperspin_table)
+        layout.addWidget(QLabel("Progreso archivo"))
+        layout.addWidget(self.hyperspin_file_progress)
+        layout.addWidget(QLabel("Progreso total"))
+        layout.addWidget(self.hyperspin_total_progress)
+        layout.addWidget(QLabel("Log"))
+        layout.addWidget(self.hyperspin_log)
+
+    def toggle_hyperspin_checks(self, state: int):
+        checked = state == Qt.CheckState.Checked.value
+        for row in range(self.hyperspin_table.rowCount()):
+            chk = self.hyperspin_table.cellWidget(row, 0)
+            if isinstance(chk, QCheckBox):
+                chk.setChecked(checked)
+
+    def _ffprobe_exe(self) -> Optional[str]:
+        bundled = Path(FFMPEG_EXE).with_name("ffprobe.exe")
+        if bundled.exists():
+            return str(bundled)
+        return shutil.which("ffprobe")
+
+    def _is_hyperspin_compatible(self, path: Path) -> bool:
+        ffprobe = self._ffprobe_exe()
+        if not ffprobe:
+            return False
+        try:
+            p = subprocess.run(
+                [ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if p.returncode != 0:
+                return False
+            data = json.loads(p.stdout or "{}")
+            streams = data.get("streams") or []
+            v = next((x for x in streams if x.get("codec_type") == "video"), None)
+            a = next((x for x in streams if x.get("codec_type") == "audio"), None)
+            if not v:
+                return False
+            container = (data.get("format") or {}).get("format_name", "")
+            video_ok = v.get("codec_name") == "h264" and v.get("pix_fmt") == "yuv420p"
+            audio_ok = (a is None) or (a.get("codec_name") == "aac" and int(a.get("sample_rate") or 0) == 48000 and int(a.get("channels") or 0) == 2)
+            container_ok = "mp4" in container
+            return video_ok and audio_ok and container_ok
+        except Exception:
+            return False
+
+    def scan_hyperspin_incompatible(self):
+        folder = self.hyperspin_folder.text().strip()
+        if not folder or not Path(folder).is_dir():
+            QMessageBox.warning(self, "HyperSpin", "Selecciona una carpeta válida")
+            return
+
+        self.hyperspin_table.setRowCount(0)
+        videos = [f for f in Path(folder).iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
+        videos.sort(key=lambda x: x.name.lower())
+        incompatible = 0
+
+        for f in videos:
+            if self._is_hyperspin_compatible(f):
+                continue
+            row = self.hyperspin_table.rowCount()
+            self.hyperspin_table.insertRow(row)
+            chk = QCheckBox()
+            self.hyperspin_table.setCellWidget(row, 0, chk)
+            name = QTableWidgetItem(f.name)
+            name.setData(Qt.ItemDataRole.UserRole, str(f))
+            self.hyperspin_table.setItem(row, 1, name)
+            self.hyperspin_table.setItem(row, 2, QTableWidgetItem("No compatible"))
+            self.hyperspin_table.setItem(row, 3, QTableWidgetItem("No compatible"))
+            self.hyperspin_table.setItem(row, 4, QTableWidgetItem("Pendiente"))
+            incompatible += 1
+
+        self.hyperspin_log.append(f"Escaneo listo: {incompatible} vídeos no compatibles")
+
+    def start_hyperspin_conversion(self):
+        ffmpeg = FFMPEG_EXE if Path(FFMPEG_EXE).exists() else (shutil.which("ffmpeg") or "")
+        if not ffmpeg:
+            QMessageBox.critical(self, "HyperSpin", "No se encontró ffmpeg.exe")
+            return
+
+        jobs: List[HyperSpinJob] = []
+        for row in range(self.hyperspin_table.rowCount()):
+            chk = self.hyperspin_table.cellWidget(row, 0)
+            item = self.hyperspin_table.item(row, 1)
+            if not isinstance(chk, QCheckBox) or not chk.isChecked() or not item:
+                continue
+            src = item.data(Qt.ItemDataRole.UserRole)
+            if not src:
+                continue
+            src_path = Path(src)
+            tmp = src_path.with_name(f"{src_path.stem}_convirtiendo{src_path.suffix}")
+            jobs.append(HyperSpinJob(str(src_path), str(tmp), row))
+
+        if not jobs:
+            QMessageBox.information(self, "HyperSpin", "No hay vídeos seleccionados")
+            return
+
+        self.hyperspin_file_progress.setValue(0)
+        self.hyperspin_total_progress.setValue(0)
+        self.hyperspin_btn_convert.setEnabled(False)
+        self.hyperspin_btn_cancel.setEnabled(True)
+        self.hyperspin_worker = HyperSpinWorker(ffmpeg, jobs)
+        self.hyperspin_worker.log.connect(self.hyperspin_log.append)
+        self.hyperspin_worker.file_progress.connect(self.hyperspin_file_progress.setValue)
+        self.hyperspin_worker.total_progress.connect(self.hyperspin_total_progress.setValue)
+        self.hyperspin_worker.file_status.connect(self._set_hyperspin_status)
+        self.hyperspin_worker.finished_all.connect(self._finish_hyperspin_conversion)
+        self.hyperspin_worker.start()
+
+    def _set_hyperspin_status(self, row: int, status: str):
+        item = self.hyperspin_table.item(row, 4)
+        if item:
+            item.setText(status)
+
+    def cancel_hyperspin_conversion(self):
+        if self.hyperspin_worker and self.hyperspin_worker.isRunning():
+            self.hyperspin_worker.cancel()
+
+    def _finish_hyperspin_conversion(self):
+        self.hyperspin_btn_convert.setEnabled(True)
+        self.hyperspin_btn_cancel.setEnabled(False)
+        self.hyperspin_log.append("Conversión HyperSpin finalizada")
 
     def log_ui(self, msg: str):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -671,6 +985,9 @@ class MainWindow(QMainWindow):
         self.log_ui("Cancelación solicitada")
 
     def closeEvent(self, event):
+        if self.hyperspin_worker and self.hyperspin_worker.isRunning():
+            self.hyperspin_worker.cancel()
+            self.hyperspin_worker.wait(1500)
         self.save_config()
         super().closeEvent(event)
 
