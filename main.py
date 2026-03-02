@@ -56,7 +56,7 @@ def parse_allowed_video_formats(raw: str) -> List[str]:
     values = [x.strip() for x in (raw or '').split(',') if x.strip()]
     valid = [x for x in values if x in VIDEO_FORMAT_SPECS]
     return valid or ['mp4 (H.264 + AAC)']
-def run_ffmpeg_convert(input_path: Path, spec: Dict[str, str], logger: DualLogger) -> Path:
+def run_ffmpeg_convert(input_path: Path, spec: Dict[str, str], logger: "DualLogger") -> Path:
     target = input_path.with_suffix(f".{spec['ext']}")
     temp_target = target.with_name(f"{target.stem}_convirtiendo{target.suffix}")
     if temp_target.exists():
@@ -91,7 +91,7 @@ def run_ffmpeg_convert(input_path: Path, spec: Dict[str, str], logger: DualLogge
     if input_path != target and input_path.exists():
         input_path.unlink()
     return target
-def run_hyperspin_compat(input_path: Path, logger: DualLogger) -> Path:
+def run_hyperspin_compat(input_path: Path, logger: "DualLogger") -> Path:
     spec = {'ext': 'mp4', 'vcodec': 'libx264', 'acodec': 'aac', 'pix_fmt': 'yuv420p'}
     logger.write('Aplicando compatibilidad HyperSpin (MP4 H.264 + AAC)...')
     return run_ffmpeg_convert(input_path, spec, logger)
