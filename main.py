@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -343,13 +344,15 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self.search_videos)
         row.addWidget(self.search_text); row.addWidget(btn)
 
-        self.search_table = QTableWidget(0, 4)
-        self.search_table.setHorizontalHeaderLabels(["Título", "Canal", "Duración", "URL"])
+        self.search_table = QTableWidget(0, 6)
+        self.search_table.setHorizontalHeaderLabels(["✔", "Título", "Canal", "Duración", "URL", "Acciones"])
         self.search_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.search_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.search_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
 
         actions = QHBoxLayout()
-        add_basket = QPushButton("Añadir selección a cesta")
-        add_basket.clicked.connect(self.add_search_to_basket)
+        add_basket = QPushButton("Añadir seleccionados a cesta")
+        add_basket.clicked.connect(self.add_checked_search_to_basket)
         actions.addWidget(add_basket)
 
         layout.addLayout(row)
@@ -473,19 +476,81 @@ class MainWindow(QMainWindow):
         for e in entries:
             row = self.search_table.rowCount()
             self.search_table.insertRow(row)
-            self.search_table.setItem(row, 0, QTableWidgetItem(e.get("title", "")))
-            self.search_table.setItem(row, 1, QTableWidgetItem(e.get("channel", "")))
-            self.search_table.setItem(row, 2, QTableWidgetItem(str(e.get("duration_string", ""))))
-            self.search_table.setItem(row, 3, QTableWidgetItem(e.get("webpage_url", "")))
+            checkbox = QCheckBox()
+            checkbox.setStyleSheet("margin-left:8px; margin-right:8px;")
+            self.search_table.setCellWidget(row, 0, checkbox)
 
-    def add_search_to_basket(self):
-        rows = {i.row() for i in self.search_table.selectionModel().selectedRows()}
-        for r in rows:
-            url = self.search_table.item(r, 3).text()
-            title = self.search_table.item(r, 0).text()
-            self.basket.append(DownloadItem(url=url, title=title, quality=self.cfg.default_video_quality, output_name=safe_filename(title)))
+            title = e.get("title", "")
+            url = e.get("webpage_url", "")
+            self.search_table.setItem(row, 1, QTableWidgetItem(title))
+            self.search_table.setItem(row, 2, QTableWidgetItem(e.get("channel", "")))
+            self.search_table.setItem(row, 3, QTableWidgetItem(str(e.get("duration_string", ""))))
+            self.search_table.setItem(row, 4, QTableWidgetItem(url))
+
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            action_layout.setSpacing(6)
+            btn_add = QPushButton("Añadir a cesta de descargas")
+            btn_now = QPushButton("Descargar ahora")
+            btn_add.clicked.connect(lambda _, r=row: self.add_search_row_to_basket(r))
+            btn_now.clicked.connect(lambda _, r=row: self.download_search_row_now(r))
+            action_layout.addWidget(btn_add)
+            action_layout.addWidget(btn_now)
+            self.search_table.setCellWidget(row, 5, action_widget)
+
+    def add_search_row_to_basket(self, row: int, refresh: bool = True):
+        if row < 0 or row >= self.search_table.rowCount():
+            return
+        url_item = self.search_table.item(row, 4)
+        title_item = self.search_table.item(row, 1)
+        if not url_item or not title_item:
+            return
+        url = url_item.text().strip()
+        title = title_item.text().strip()
+        if not url:
+            return
+        self.basket.append(DownloadItem(url=url, title=title, quality=self.cfg.default_video_quality, output_name=safe_filename(title)))
+        if refresh:
+            self.refresh_all_tables()
+            self.save_config()
+
+    def add_checked_search_to_basket(self):
+        added = 0
+        for row in range(self.search_table.rowCount()):
+            checkbox = self.search_table.cellWidget(row, 0)
+            if isinstance(checkbox, QCheckBox) and checkbox.isChecked():
+                self.add_search_row_to_basket(row, refresh=False)
+                checkbox.setChecked(False)
+                added += 1
+        if added == 0:
+            QMessageBox.information(self, "Búsqueda", "No hay elementos marcados")
+            return
         self.refresh_all_tables()
         self.save_config()
+
+    def download_search_row_now(self, row: int):
+        if row < 0 or row >= self.search_table.rowCount():
+            return
+        url_item = self.search_table.item(row, 4)
+        title_item = self.search_table.item(row, 1)
+        if not url_item or not title_item:
+            return
+        url = url_item.text().strip()
+        title = title_item.text().strip()
+        if not url:
+            return
+        item = DownloadItem(
+            url=url,
+            title=title,
+            quality=self.cfg.default_video_quality,
+            output_name=safe_filename(title),
+            status="En cola",
+        )
+        self.downloads.append(item)
+        self.refresh_all_tables()
+        self.save_config()
+        self.tabs.setCurrentWidget(self.tab_downloads)
 
     def add_url_to_basket(self):
         urls = split_urls(self.manager_url.text().strip())
