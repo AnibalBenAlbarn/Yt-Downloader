@@ -173,12 +173,23 @@ class MetadataWorker(QThread):
             target = self.url if not self.query else f"ytsearch{SEARCH_RESULTS_LIMIT}:{self.url}"
             cmd = [YTDLP_EXE, "--no-config", "--skip-download", "-J"]
             if self.query:
-                cmd.extend(["--playlist-end", str(SEARCH_RESULTS_LIMIT)])
+                # Evita fallos por vídeos con restricciones (edad/cookies/js runtime)
+                # durante la búsqueda: para poblar la tabla basta con metadatos planos.
+                cmd.extend(["--flat-playlist", "--playlist-end", str(SEARCH_RESULTS_LIMIT)])
             cmd.append(target)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if p.returncode != 0:
+            raw_stdout = (p.stdout or "").strip()
+            parsed: Optional[Dict[str, Any]] = None
+            if raw_stdout:
+                try:
+                    candidate = json.loads(raw_stdout)
+                    if isinstance(candidate, dict):
+                        parsed = candidate
+                except json.JSONDecodeError:
+                    parsed = None
+            if parsed is None and p.returncode != 0:
                 raise RuntimeError(p.stderr.strip() or "Error consultando metadatos")
-            self.done.emit(json.loads(p.stdout))
+            self.done.emit(parsed or {})
         except Exception as e:
             self.error.emit(str(e))
 class DownloadWorker(QThread):
@@ -645,7 +656,8 @@ class MainWindow(QMainWindow):
             url = resolve_search_url(e)
             duration_text = str(e.get("duration_string", "") or "").strip() or format_duration(e.get("duration"))
             self.search_table.setItem(row, 1, QTableWidgetItem(title))
-            self.search_table.setItem(row, 2, QTableWidgetItem(e.get("channel", "")))
+            channel = str(e.get("channel") or e.get("uploader") or e.get("channel_id") or "")
+            self.search_table.setItem(row, 2, QTableWidgetItem(channel))
             self.search_table.setItem(row, 3, QTableWidgetItem(duration_text))
             self.search_table.setItem(row, 4, QTableWidgetItem(url))
             action_widget = QWidget()
