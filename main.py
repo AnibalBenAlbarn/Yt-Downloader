@@ -62,6 +62,27 @@ def safe_filename(text: str) -> str:
     return text[:180] or "video"
 def split_urls(text: str) -> List[str]:
     return [x.strip() for x in re.split(r"[\s]+", text or "") if x.strip().lower().startswith("http")]
+def format_duration(seconds: Any) -> str:
+    try:
+        value = int(float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if value < 0:
+        return ""
+    h, rem = divmod(value, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+def resolve_search_url(entry: Dict[str, Any]) -> str:
+    direct_url = str(entry.get("webpage_url") or entry.get("original_url") or entry.get("url") or "").strip()
+    if direct_url.startswith(("http://", "https://")):
+        return direct_url
+    vid = str(entry.get("id") or "").strip()
+    extractor = str(entry.get("extractor_key") or entry.get("ie_key") or "").lower()
+    if extractor == "youtube" and vid:
+        return f"https://www.youtube.com/watch?v={vid}"
+    if direct_url and vid and not direct_url.endswith(vid):
+        return f"{direct_url.rstrip('/')}/{vid}"
+    return direct_url or vid
 def parse_allowed_video_formats(raw: str) -> List[str]:
     values = [x.strip() for x in (raw or '').split(',') if x.strip()]
     valid = [x for x in values if x in VIDEO_FORMAT_SPECS]
@@ -152,7 +173,7 @@ class MetadataWorker(QThread):
             target = self.url if not self.query else f"ytsearch{SEARCH_RESULTS_LIMIT}:{self.url}"
             cmd = [YTDLP_EXE, "--no-config", "--skip-download", "-J"]
             if self.query:
-                cmd.extend(["--flat-playlist", "--playlist-end", str(SEARCH_RESULTS_LIMIT)])
+                cmd.extend(["--playlist-end", str(SEARCH_RESULTS_LIMIT)])
             cmd.append(target)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if p.returncode != 0:
@@ -621,10 +642,11 @@ class MainWindow(QMainWindow):
             checkbox.setStyleSheet("margin-left:8px; margin-right:8px;")
             self.search_table.setCellWidget(row, 0, checkbox)
             title = e.get("title", "")
-            url = e.get("webpage_url", "")
+            url = resolve_search_url(e)
+            duration_text = str(e.get("duration_string", "") or "").strip() or format_duration(e.get("duration"))
             self.search_table.setItem(row, 1, QTableWidgetItem(title))
             self.search_table.setItem(row, 2, QTableWidgetItem(e.get("channel", "")))
-            self.search_table.setItem(row, 3, QTableWidgetItem(str(e.get("duration_string", ""))))
+            self.search_table.setItem(row, 3, QTableWidgetItem(duration_text))
             self.search_table.setItem(row, 4, QTableWidgetItem(url))
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
