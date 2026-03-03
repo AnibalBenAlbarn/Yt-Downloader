@@ -432,10 +432,9 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(self.add_url_to_basket)
         btn_quick.clicked.connect(self.quick_download)
         row.addWidget(self.manager_url); row.addWidget(btn_add); row.addWidget(btn_quick)
-        self.basket_table = QTableWidget(0, 9)
-        self.basket_table.setHorizontalHeaderLabels(["URL", "Título", "Duración", "Modo", "Calidad", "Formato", "Salida", "Estado", "Acciones"])
+        self.basket_table = QTableWidget(0, 8)
+        self.basket_table.setHorizontalHeaderLabels(["URL", "Título", "Duración", "Modo", "Calidad", "Formato", "Salida", "Estado"])
         self.basket_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.basket_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         self._configure_table_interactions(self.basket_table)
         actions = QHBoxLayout()
         btn_send = QPushButton("Añadir a descargas")
@@ -484,6 +483,7 @@ class MainWindow(QMainWindow):
         CONFIG_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         self.log_ui("Configuración guardada en config.json")
     def refresh_all_tables(self):
+        self._collect_table_edits()
         self._fill_table(self.basket_table, self.basket, include_progress=False)
         self._fill_table(self.downloads_table, self.downloads, include_progress=True)
         self._refresh_total_progress()
@@ -508,10 +508,22 @@ class MainWindow(QMainWindow):
             subprocess.run(["xdg-open", str(folder)], check=False)
 
     def _cancel_item_download(self, item: DownloadItem):
+        self._collect_table_edits()
         worker = self.active_workers.get(item.url)
         if worker:
             worker.cancel()
             item.status = "Cancelado"
+
+    def _restart_item_download(self, item: DownloadItem):
+        self._collect_table_edits()
+        if item.url in self.active_workers:
+            return
+        item.progress = 0
+        item.retry_count = 0
+        item.status = "En cola"
+        self.save_config()
+        self._schedule_downloads()
+        self.refresh_all_tables()
 
     def _ask_delete_mode(self) -> Optional[str]:
         ask = QMessageBox(self)
@@ -548,6 +560,7 @@ class MainWindow(QMainWindow):
         self._delete_item_with_mode(source, row, delete_file=delete_mode == "record_and_file")
 
     def show_table_context_menu(self, table: QTableWidget, pos):
+        self._collect_table_edits()
         rows = sorted({i.row() for i in table.selectionModel().selectedRows()}, reverse=True)
         if not rows:
             return
@@ -592,22 +605,26 @@ class MainWindow(QMainWindow):
             table.setItem(row, 7, QTableWidgetItem(it.status))
             if include_progress:
                 table.setItem(row, 8, QTableWidgetItem(str(it.progress)))
-            if (table is self.basket_table) or (table is self.downloads_table):
+            if table is self.downloads_table:
                 action_widget = QWidget()
                 action_layout = QHBoxLayout(action_widget)
                 action_layout.setContentsMargins(0, 0, 0, 0)
                 action_layout.setSpacing(4)
                 btn_open = QPushButton("📁")
                 btn_cancel = QPushButton("⏹")
+                btn_restart = QPushButton("↻")
                 btn_delete = QPushButton("🗑")
                 btn_open.setToolTip("Abrir carpeta")
                 btn_cancel.setToolTip("Cancelar descarga")
+                btn_restart.setToolTip("Reiniciar descarga")
                 btn_delete.setToolTip("Eliminar registro")
                 btn_open.clicked.connect(lambda _, item=it: self._open_item_folder(item))
                 btn_cancel.clicked.connect(lambda _, item=it: self._cancel_item_download(item))
+                btn_restart.clicked.connect(lambda _, item=it: self._restart_item_download(item))
                 btn_delete.clicked.connect(lambda _, r=row, s=items: self._delete_row_action(s, r))
                 action_layout.addWidget(btn_open)
                 action_layout.addWidget(btn_cancel)
+                action_layout.addWidget(btn_restart)
                 action_layout.addWidget(btn_delete)
                 action_column = 9 if include_progress else 8
                 table.setCellWidget(row, action_column, action_widget)
@@ -621,9 +638,15 @@ class MainWindow(QMainWindow):
     def _collect_table_edits(self):
         def update_from_table(table: QTableWidget, target: List[DownloadItem], has_progress: bool):
             for i, item in enumerate(target):
-                item.mode = table.cellWidget(i, 3).currentText()  # type: ignore
-                item.quality = table.cellWidget(i, 4).currentText()  # type: ignore
-                item.video_format = table.cellWidget(i, 5).currentText()  # type: ignore
+                mode_widget = table.cellWidget(i, 3)
+                if isinstance(mode_widget, QComboBox):
+                    item.mode = mode_widget.currentText()
+                quality_widget = table.cellWidget(i, 4)
+                if isinstance(quality_widget, QComboBox):
+                    item.quality = quality_widget.currentText()
+                format_widget = table.cellWidget(i, 5)
+                if isinstance(format_widget, QComboBox):
+                    item.video_format = format_widget.currentText()
                 item.output_name = (table.item(i, 6).text() if table.item(i, 6) else item.output_name).strip()
                 if has_progress and table.item(i, 8):
                     try:
