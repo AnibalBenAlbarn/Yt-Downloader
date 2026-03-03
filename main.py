@@ -147,6 +147,8 @@ class AppConfig:
     allowed_video_formats: str = "mp4 (H.264 + AAC), mkv (H.264 + AAC), webm (VP9 + Opus)"
     default_audio_quality: str = "128K"
     hyperspin_enabled: bool = False
+    cookies_from_browser: str = ""
+    cookies_file: str = ""
 @dataclass
 class DownloadItem:
     url: str
@@ -164,14 +166,16 @@ class DownloadItem:
 class MetadataWorker(QThread):
     done = pyqtSignal(dict)
     error = pyqtSignal(str)
-    def __init__(self, url: str, query: bool = False):
+    def __init__(self, url: str, query: bool = False, auth_args: Optional[List[str]] = None):
         super().__init__()
         self.url = url
         self.query = query
+        self.auth_args = auth_args or []
     def run(self):
         try:
             target = self.url if not self.query else f"ytsearch{SEARCH_RESULTS_LIMIT}:{self.url}"
             cmd = [YTDLP_EXE, "--no-config", "--skip-download", "-J"]
+            cmd.extend(self.auth_args)
             if self.query:
                 # Evita fallos por vídeos con restricciones (edad/cookies/js runtime)
                 # durante la búsqueda: para poblar la tabla basta con metadatos planos.
@@ -212,6 +216,17 @@ class DownloadWorker(QThread):
         if q.isdigit():
             return f"bestvideo[height<={q}]+bestaudio/best[height<={q}]/best"
         return "bestvideo+bestaudio/best"
+
+    def _auth_args(self) -> List[str]:
+        args: List[str] = []
+        cookies_file = (self.cfg.cookies_file or "").strip()
+        cookies_from_browser = (self.cfg.cookies_from_browser or "").strip()
+        if cookies_file:
+            args.extend(["--cookies", cookies_file])
+        elif cookies_from_browser:
+            args.extend(["--cookies-from-browser", cookies_from_browser])
+        return args
+
     def run(self):
         log = DualLogger(LOG_DIR / f"{now_stamp()}_{safe_filename(self.item.title)}.log", self.ui_log)
         out_dir = self.cfg.video_dir if self.item.mode == "video" else self.cfg.audio_dir
@@ -237,6 +252,7 @@ class DownloadWorker(QThread):
         ]
         if self.item.mode == "audio":
             cmd.extend(["-x", "--audio-format", "mp3", "--audio-quality", self.cfg.default_audio_quality])
+        cmd.extend(self._auth_args())
         self.status.emit(self.item.url, "Descargando")
         log.write("CMD: " + " ".join(cmd))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
@@ -367,6 +383,8 @@ class MainWindow(QMainWindow):
         self.allowed_video_formats.setPlaceholderText(", ".join(VIDEO_FORMAT_SPECS.keys()))
         self.default_audio_q = QComboBox(); self.default_audio_q.addItems(["320K", "256K", "192K", "128K", "96K"])
         self.hyperspin_enabled = QCheckBox("Convertir cada vídeo descargado a perfil HyperSpin (MP4 H.264 + AAC)")
+        self.cookies_from_browser = QComboBox(); self.cookies_from_browser.addItems(["", "chrome", "edge", "firefox", "brave", "opera", "vivaldi", "safari"])
+        self.cookies_file = QLineEdit(); self.cookies_file.setPlaceholderText("Ruta a cookies.txt exportado (opcional)")
         form.addRow("Carpeta vídeo", rv)
         form.addRow("Carpeta audio", ra)
         form.addRow("Descargas simultáneas", self.simultaneous)
@@ -375,6 +393,8 @@ class MainWindow(QMainWindow):
         form.addRow("Formatos de vídeo permitidos", self.allowed_video_formats)
         form.addRow("Calidad audio por defecto", self.default_audio_q)
         form.addRow("Compatibilidad HyperSpin", self.hyperspin_enabled)
+        form.addRow("Cookies desde navegador", self.cookies_from_browser)
+        form.addRow("Archivo cookies", self.cookies_file)
         btn_save = QPushButton("Guardar en config.json")
         btn_save.clicked.connect(self.save_config)
         btn_video.clicked.connect(lambda: self.pick_dir(self.video_dir))
@@ -466,6 +486,8 @@ class MainWindow(QMainWindow):
         self.allowed_video_formats.setText(self.cfg.allowed_video_formats)
         self.default_audio_q.setCurrentText(self.cfg.default_audio_quality)
         self.hyperspin_enabled.setChecked(self.cfg.hyperspin_enabled)
+        self.cookies_from_browser.setCurrentText(self.cfg.cookies_from_browser)
+        self.cookies_file.setText(self.cfg.cookies_file)
     def save_config(self):
         self.cfg.video_dir = self.video_dir.text().strip()
         self.cfg.audio_dir = self.audio_dir.text().strip()
@@ -475,6 +497,8 @@ class MainWindow(QMainWindow):
         self.cfg.allowed_video_formats = self.allowed_video_formats.text().strip()
         self.cfg.default_audio_quality = self.default_audio_q.currentText()
         self.cfg.hyperspin_enabled = self.hyperspin_enabled.isChecked()
+        self.cfg.cookies_from_browser = self.cookies_from_browser.currentText().strip()
+        self.cfg.cookies_file = self.cookies_file.text().strip()
         payload = {
             "settings": asdict(self.cfg),
             "basket": [asdict(x) for x in self.basket],
@@ -659,7 +683,7 @@ class MainWindow(QMainWindow):
         q = self.search_text.text().strip()
         if not q:
             return
-        w = MetadataWorker(q, query=True)
+        w = MetadataWorker(q, query=True, auth_args=self._auth_args())
         w.done.connect(self.on_search_done)
         w.error.connect(lambda e: QMessageBox.warning(self, "Error búsqueda", e))
         w.start()
@@ -764,7 +788,7 @@ class MainWindow(QMainWindow):
         self.save_config()
 
     def _fetch_metadata_for_item(self, item: DownloadItem):
-        w = MetadataWorker(item.url)
+        w = MetadataWorker(item.url, auth_args=self._auth_args())
         def done(data: Dict[str, Any], target=item):
             target.title = data.get("title", target.url)
             target.duration = str(data.get("duration_string", "") or "")
@@ -798,7 +822,7 @@ class MainWindow(QMainWindow):
                 self.refresh_all_tables()
                 self.save_config()
                 self.tabs.setCurrentWidget(self.tab_downloads)
-        w = MetadataWorker(url)
+        w = MetadataWorker(url, auth_args=self._auth_args())
         w.done.connect(open_dialog)
         w.error.connect(lambda e: QMessageBox.warning(self, "Error", e))
         w.start()
@@ -821,6 +845,17 @@ class MainWindow(QMainWindow):
             self.basket.pop(r)
         self.refresh_all_tables()
         self.save_config()
+
+    def _auth_args(self) -> List[str]:
+        args: List[str] = []
+        cookies_file = (self.cfg.cookies_file or "").strip()
+        cookies_from_browser = (self.cfg.cookies_from_browser or "").strip()
+        if cookies_file:
+            args.extend(["--cookies", cookies_file])
+        elif cookies_from_browser:
+            args.extend(["--cookies-from-browser", cookies_from_browser])
+        return args
+
     def _is_retryable_error(self, err: str) -> bool:
         return not any(token in err for token in NON_RETRYABLE_ERROR_PATTERNS)
 
